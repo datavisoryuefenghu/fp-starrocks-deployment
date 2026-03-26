@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cre-6630-starrocks
+  namespace: qa-security
+  labels:
+    app: cre-6630-starrocks
+spec:
+  type: ClusterIP
+  ports:
+    - name: mysql
+      port: 9030
+      targetPort: mysql
+      protocol: TCP
+    - name: http
+      port: 8030
+      targetPort: http
+      protocol: TCP
+  selector:
+    app: cre-6630-starrocks
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cre-6630-starrocks
+  namespace: qa-security
+  labels:
+    app: cre-6630-starrocks
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cre-6630-starrocks
+  template:
+    metadata:
+      labels:
+        app: cre-6630-starrocks
+    spec:
+      containers:
+        - name: starrocks
+          image: starrocks/allin1-ubuntu:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mysql
+              containerPort: 9030
+              protocol: TCP
+            - name: http
+              containerPort: 8030
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: mysql
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: mysql
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi

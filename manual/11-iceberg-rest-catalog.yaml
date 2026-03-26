@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iceberg-rest-catalog
+  namespace: qa-security
+  labels:
+    app: iceberg-rest-catalog
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iceberg-rest-catalog
+  namespace: qa-security
+  labels:
+    app: iceberg-rest-catalog
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8181
+      targetPort: http
+      protocol: TCP
+  selector:
+    app: iceberg-rest-catalog
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iceberg-rest-catalog
+  namespace: qa-security
+  labels:
+    app: iceberg-rest-catalog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iceberg-rest-catalog
+  template:
+    metadata:
+      labels:
+        app: iceberg-rest-catalog
+    spec:
+      serviceAccountName: iceberg-rest-catalog
+      initContainers:
+        - name: mysql-jdbc
+          image: curlimages/curl:8.7.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -euo pipefail
+              curl -fsSL \
+                https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.33/mysql-connector-j-8.0.33.jar \
+                -o /work/mysql-connector-j-8.0.33.jar
+          volumeMounts:
+            - name: mysql-jdbc
+              mountPath: /work
+      containers:
+        - name: iceberg-rest-catalog
+          image: tabulario/iceberg-rest:1.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - java
+            - -cp
+            - /usr/lib/iceberg-rest/iceberg-rest-image-all.jar:/usr/lib/iceberg-rest/mysql-connector-j-8.0.33.jar
+            - org.apache.iceberg.rest.RESTCatalogServer
+          ports:
+            - name: http
+              containerPort: 8181
+              protocol: TCP
+          env:
+            - name: CATALOG_WAREHOUSE
+              value: "s3://datavisor-dev-us-west-2-iceberg/cre-6630/qa-security/"
+            - name: CATALOG_IO__IMPL
+              value: "org.apache.iceberg.aws.s3.S3FileIO"
+            - name: CATALOG_URI
+              value: "jdbc:mysql://iceberg-catalog-mysql.qa-security:3306/iceberg_catalog"
+            - name: CATALOG_JDBC_USER
+              valueFrom:
+                secretKeyRef:
+                  name: iceberg-rest-catalog-secret
+                  key: jdbc-user
+            - name: CATALOG_JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: iceberg-rest-catalog-secret
+                  key: jdbc-password
+            - name: AWS_REGION
+              value: "us-west-2"
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: mysql-jdbc
+              mountPath: /usr/lib/iceberg-rest/mysql-connector-j-8.0.33.jar
+              subPath: mysql-connector-j-8.0.33.jar
+      volumes:
+        - name: mysql-jdbc
+          emptyDir: {}
