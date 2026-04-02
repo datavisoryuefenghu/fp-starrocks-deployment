@@ -50,9 +50,9 @@ spec:
                 PROPERTIES (
                   'type' = 'iceberg',
                   'iceberg.catalog.type' = 'rest',
-                  'iceberg.catalog.uri' = 'http://iceberg-rest-catalog:8181',
-                  'aws.s3.region' = '{{ .Values.iceberg.restCatalog.s3Region }}',
-                  'aws.s3.use_instance_profile' = 'true'
+                  'iceberg.catalog.uri' = '{{ .Values.iceberg.restCatalog.uri }}',
+                  'aws.s3.region' = '{{ .Values.starrocks.fe.s3.region }}',
+                  'aws.s3.use_instance_profile' = '{{ .Values.starrocks.fe.s3.useInstanceProfile }}'
                 );
               "
 

@@ -2,26 +2,23 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: iceberg-rest-catalog
-  namespace: duckdb
   labels:
     app.kubernetes.io/name: iceberg-rest-catalog
-    app.kubernetes.io/managed-by: manual
+    {{- include "chart.labels" . | nindent 4 }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: iceberg-rest-catalog
-  namespace: duckdb
   labels:
     app.kubernetes.io/name: iceberg-rest-catalog
-    app.kubernetes.io/managed-by: manual
+    {{- include "chart.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
   ports:
     - name: rest
       port: 8181
       targetPort: rest
-      protocol: TCP
   selector:
     app.kubernetes.io/name: iceberg-rest-catalog
 ---
@@ -29,12 +26,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: iceberg-rest-catalog
-  namespace: duckdb
   labels:
     app.kubernetes.io/name: iceberg-rest-catalog
-    app.kubernetes.io/managed-by: manual
+    {{- include "chart.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.iceberg.restCatalog.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: iceberg-rest-catalog
@@ -47,7 +43,6 @@ spec:
       initContainers:
         - name: mysql-jdbc
           image: curlimages/curl:8.7.1
-          imagePullPolicy: IfNotPresent
           command:
             - sh
             - -c
@@ -61,8 +56,7 @@ spec:
               mountPath: /work
       containers:
         - name: iceberg-rest
-          image: tabulario/iceberg-rest:1.6.0
-          imagePullPolicy: IfNotPresent
+          image: {{ .Values.iceberg.restCatalog.image }}
           command:
             - java
             - -cp
@@ -71,45 +65,37 @@ spec:
           ports:
             - name: rest
               containerPort: 8181
-              protocol: TCP
           env:
             - name: CATALOG_WAREHOUSE
-              value: "s3://datavisor-dev-us-west-2-iceberg/cre-6630/duckdb/"
+              value: {{ .Values.iceberg.restCatalog.s3.warehousePrefix | quote }}
             - name: CATALOG_IO__IMPL
               value: "org.apache.iceberg.aws.s3.S3FileIO"
             - name: CATALOG_URI
-              value: "jdbc:mysql://iceberg-catalog-mysql.duckdb:3306/iceberg_catalog"
+              value: "jdbc:mysql://{{ .Values.fpMysql.host }}:{{ .Values.fpMysql.port }}/{{ .Values.fpMysql.icebergCatalogDb }}"
             - name: CATALOG_JDBC_USER
               valueFrom:
                 secretKeyRef:
-                  name: iceberg-rest-catalog-secret
+                  name: {{ .Values.iceberg.restCatalog.jdbcSecret.name }}
                   key: jdbc-user
             - name: CATALOG_JDBC_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: iceberg-rest-catalog-secret
+                  name: {{ .Values.iceberg.restCatalog.jdbcSecret.name }}
                   key: jdbc-password
             - name: AWS_REGION
-              value: "us-west-2"
+              value: {{ .Values.iceberg.restCatalog.s3.region | quote }}
           readinessProbe:
             tcpSocket:
               port: rest
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 3
           livenessProbe:
             tcpSocket:
               port: rest
             initialDelaySeconds: 20
             periodSeconds: 20
-            timeoutSeconds: 3
           resources:
-            requests:
-              cpu: 250m
-              memory: 512Mi
-            limits:
-              cpu: "1"
-              memory: 1Gi
+            {{- toYaml .Values.iceberg.restCatalog.resources | nindent 12 }}
           volumeMounts:
             - name: mysql-jdbc
               mountPath: /usr/lib/iceberg-rest/mysql-connector-j-8.0.33.jar
