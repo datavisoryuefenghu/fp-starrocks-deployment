@@ -6,7 +6,7 @@ iceberg:
 
 starrocks:
   fe:
-    image: "starrocks/fe-ubuntu:3.3-latest"
+    image: "starrocks/fe-ubuntu:4.0.8"
     replicas: 1
     storageSize: 10Gi
     storageClass: aws-ebs-csi
@@ -17,20 +17,25 @@ starrocks:
       useInstanceProfile: true
     resources:
       requests:
-        cpu: "1"
-        memory: 4Gi
+        cpu: "2"
+        memory: 6Gi
       limits:
         cpu: "2"
-        memory: 8Gi
+        memory: 6Gi
 
   cn:
-    image: "starrocks/cn-ubuntu:3.3-latest"
+    image: "starrocks/cn-ubuntu:4.0.8"
     replicas: 1
     cacheSizeLimit: 10Gi
     resources:
       requests:
-        cpu: "1"
-        memory: 4Gi
+        cpu: "2"
+        memory: 8Gi
       limits:
         cpu: "2"
         memory: 8Gi
+    hpa:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 70

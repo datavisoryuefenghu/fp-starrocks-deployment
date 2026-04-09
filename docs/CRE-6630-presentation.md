@@ -138,7 +138,7 @@ Returns:
                                          │
                                          ↓
                               ┌────────────────────────────┐
-                              │ StarRocks CN（单节点，Spot）│
+                              │ StarRocks CN（单节点，On-Demand）│
                               │ 白天: 在线查询（读 MV）     │
                               │ 凌晨: MV refresh（扫 S3）   │
                               └────────────┬───────────────┘
@@ -455,7 +455,7 @@ For issues encountered during deployment and their resolutions, see [Appendix �
 
 | Task | Description | Priority |
 |------|------|--------|
-| CN node Spot migration | Create Spot ASG + Launch Template (m5.2xlarge), run CN on Spot to save ~74% cost | P0 |
+| CN node On-Demand deployment | Create On-Demand node group + Launch Template (m5.2xlarge). Base CN runs on On-Demand for query availability; Spot node group reserved for future burst scaling | P0 |
 | CN node spec upgrade | Current 1C/4Gi is dev spec; production requires 8C/32Gi (see design-qa D3) | P0 |
 | Kafka Connect commit interval adjustment | Change from 60s to 10min to reduce small files (see design-qa D14) | P0 |
 | Kafka Connect templatization | Current connector config is hand-written per-tenant; needs parameterization to support new tenant onboarding | P1 |
@@ -521,39 +521,33 @@ Reasons for not using a shared table with `WHERE tenant` filtering: MV DDL is cl
 
 ### 13.2 CN Deployment Options
 
-| | Option A | Option B ★ | Option C |
+| | Option A ★ | Option B | Option C |
 |--|--|--|--|
 | Architecture | 1× on-demand | 1× spot | 2× spot (HA) |
 | Monthly cost | ~$276 | ~$72 | ~$144 (or ~$100 with smaller spec) |
 | Interruption impact | None | Occasional 2-3min | Rare (probability of both being reclaimed simultaneously is very low) |
 
-**Why can a persistent service run on Spot?** CN is stateless — data lives in S3, and local storage is only block cache (which can be rebuilt from S3 if lost). When a Spot instance is reclaimed: in-flight queries fail (fp-async can retry), zero data loss, and a new CN recovers within 2-3 minutes. "Always running" does not mean "cannot be interrupted" — what matters is that the cost of interruption is low.
+**Why On-Demand for the base CN?** CN is stateless (data lives in S3), but it continuously serves online queries. When a Spot instance is reclaimed, in-flight queries fail immediately — users see errors. "Stateless" means **no data loss** on interruption, but it does not mean **query interruption is acceptable**. For a continuously serving query layer, availability takes priority over cost optimization.
 
-**Choose Option B**: ToB system; fp-async can retry; occasional 2-3min interruptions are acceptable; saves 74%. Enable Capacity Rebalancing on the ASG (AWS proactively starts a new node when it detects reclamation risk, then terminates the old node) to further reduce the interruption gap.
+**Choose Option A**: On-Demand guarantees query availability with zero interruption risk. ~$276/month is a reasonable investment for a core infrastructure component.
 
-**If HA is required → Option C variant: 2× smaller spot instances**
+**Future scaling: base On-Demand + burst Spot**
 
-With 2 CNs, each node does not need to bear the full compute load, so a smaller spec can be used:
+When query concurrency grows and multiple CNs are needed, use a hybrid strategy:
 
-| | Option B (1× large) | Option C variant (2× small) |
+| | Base CN (On-Demand) | Burst CN (Spot) |
 |--|--|--|
-| Spec | m5.2xlarge (8C/32Gi) | m5.xlarge (4C/16Gi) × 2 |
-| Total compute | 8 CPU / 32Gi | 8 CPU / 32Gi (same) |
-| Spot unit price | ~$0.10/h | ~$0.05/h × 2 |
-| Monthly cost | ~$72 | ~$72 (roughly the same) |
-| HA | None; 2-3min interruption | If 1 is reclaimed, the other continues serving |
-| Nightly MV refresh | 8 CPU exclusive, fast | StarRocks FE distributes to 2 CNs in parallel; comparable speed |
-| Block cache | 16Gi centralized | 8Gi × 2 distributed; slightly lower cache hit rate |
+| Role | Always-on; guarantees baseline query capacity | HPA-scaled overflow capacity |
+| Interruption impact | None | Spot reclaimed → falls back to base capacity level; no outage |
+| Lifecycle | Persistent | Scaled up/down on demand |
 
-Option C variant trade-off: **nearly the same cost, gains HA, but smaller per-node block cache** (8Gi vs 16Gi). In practice the impact is negligible: MV query data volume is tiny (a few KB) and 8Gi is more than sufficient; when falling back to scanning raw Parquet, the data volume far exceeds any cache size (130,000 files), and 16Gi wouldn't fit it either — the bottleneck is S3 I/O, not cache.
-
-If occasional 2-3min interruptions are acceptable → Option B (simpler). If the team or leadership has zero tolerance for interruptions → Option C variant (same cost, gains HA).
+This way, the worst case when Spot is reclaimed is "performance degrades to base level" rather than "service outage." Cost savings without risking availability.
 
 ### 13.3 CN Node Spec
 
-**Option B (1 CN)**: m5.2xlarge (8 CPU / 32Gi). CPU requests == limits to avoid throttling. Memory allocation: JVM heap 8Gi (25%) + block cache 16Gi (50%) + system 8Gi (25%).
+**Current (1 CN, On-Demand)**: m5.2xlarge (8 CPU / 32Gi). CPU requests == limits to avoid throttling. Memory allocation: JVM heap 8Gi (25%) + block cache 16Gi (50%) + system 8Gi (25%). Monthly cost ~$276.
 
-**Option C variant (2 CN HA)**: m5.xlarge (4 CPU / 16Gi) × 2. JVM heap 4Gi + block cache 8Gi + system 4Gi. Requires PodDisruptionBudget `minAvailable: 1`.
+**Future HA expansion (2 CN)**: m5.xlarge (4 CPU / 16Gi) × 2. JVM heap 4Gi + block cache 8Gi + system 4Gi. Requires PodDisruptionBudget `minAvailable: 1`.
 
 ### 13.4 When Scaling Becomes Necessary
 
@@ -561,44 +555,85 @@ Not needed now, but the following scenarios would trigger it:
 
 | Scenario | Symptom | Action |
 |------|------|---------|
-| **Significant growth in tenant count + query concurrency** | CN CPU sustained >60%; query P99 degrades | Add HPA (controls pod count) + Cluster Autoscaler + Spot ASG (controls node count). HPA scales pods → pods become Pending → CA automatically requests new Spot nodes from ASG |
+| **Significant growth in tenant count + query concurrency** | CN CPU sustained >60%; query P99 degrades | Add HPA (controls pod count) + Cluster Autoscaler. Base CN stays On-Demand; burst overflow CNs use Spot ASG to save cost. HPA scales pods → pods become Pending → CA requests new Spot nodes from ASG |
+| **Morning rush: concentrated query burst** | Daily fixed window (e.g., 9-10am) when multiple tenants refresh dashboards simultaneously; CN CPU spikes briefly | Different from scenario 1: this is a daily periodic burst, not a long-term trend. Use HPA elasticity (auto scale-down after CPU drops) or CronJob scheduled scaling (more predictable, avoids HPA reaction delay) |
 | **More tenants cause MV refresh to extend into business hours** | Doesn't finish at night; contends with daytime queries | Split CN into Query and Refresh Deployments with independent scaling strategies |
 | **Large single-tenant onboard; historical data backfill is slow** | Initial MV backfill takes 24h+ | Temporarily scale up CN to accelerate backfill, then scale back down |
 | **MV not ready; fallback scans raw Parquet** | Query latency degrades from milliseconds to minutes | **Do not rely on HPA** — the fundamental solution is to trigger MV backfill at onboarding time and block queries until MV is ready (see Section 5.3). If backfill itself is too slow, temporarily add CNs manually for parallel acceleration |
 
+**Expected behavior when burst Spot CNs are reclaimed:**
+
+In the scenarios above, burst overflow CNs run on Spot. The impact of Spot interruption must be clearly defined:
+
+| Aspect | Behavior |
+|------|------|
+| Query routing | StarRocks FE automatically detects CN going offline; subsequent queries are routed to remaining CNs (base On-Demand + surviving burst) |
+| In-flight queries | Queries executing on the reclaimed CN will fail; clients must retry. Impact is limited to concurrent queries on that CN only; other CNs are unaffected |
+| Pod replacement | HPA target replicas unchanged → reclaimed pod becomes Pending → CA automatically requests a new Spot node from ASG to replace it |
+| Worst case | All burst Spot CNs reclaimed simultaneously → falls back to base On-Demand capacity; service continues without outage, only performance degrades |
+
 ### 13.5 Why Use Cluster Autoscaler + ASG Instead of dcluster
 
-dcluster can technically do this (e.g., write a bridge that monitors CPU → calls the dcluster API to add/remove nodes), but CA + ASG is the better path.
+dcluster can technically manage burst Spot CN nodes, but we choose not to for three reasons:
 
-**Actual effort comparison between the two approaches:**
+**Problem 1: Missing trigger mechanism — who calls dcluster?**
+
+This is the core issue. HPA has a **built-in feedback loop** — the entire chain is fully automatic:
+
+```
+HPA observes CPU metric → decides to add/remove replicas → Pending Pod triggers CA → CA calls ASG
+```
+
+dcluster has no such mechanism. It is designed to be explicitly called by a job scheduler (`POST /node/launch`); it does not observe metrics and make scaling decisions on its own. Using dcluster means building a bridge:
+
+```
+bridge polls Prometheus CPU metric → above threshold: call dcluster API → dcluster launches node
+                                   → below threshold: call dcluster API → dcluster destroys node
+(includes threshold logic, API retry on failure, debounce)
+```
+
+This adds an extra layer — a custom component that manually reimplements what HPA does natively.
+
+**Problem 2: Upgrading dcluster = platform-wide re-release risk**
+
+dcluster serves the entire platform's Spark/Flink jobs. Modifying dcluster for StarRocks CN support (e.g., adding "service type" recognition so Monitor doesn't reclaim persistent CNs) means:
+- dcluster requires a new version release, affecting all existing users (Spark, Flink)
+- Changes to Monitor logic carry regression risk — misclassification could cause Spark/Flink nodes to be incorrectly reclaimed or retained
+- Release windows, rollback plans, and compatibility testing all require coordination
+
+CA + ASG are independent AWS/K8s standard components. Adding or removing a StarRocks ASG affects no other system.
+
+**Problem 3: Monitor orphan reclamation conflicts with HPA scaleDown**
+
+dcluster Monitor checks every 5 minutes for nodes with no running jobs and reclaims them. Burst CNs may be temporarily idle during query troughs, but HPA hasn't decided to scale down yet (still within stabilizationWindow) — Monitor would treat these nodes as orphans and reclaim them prematurely, causing pod eviction and query disruption. The fix requires adding whitelist logic to Monitor, which circles back to Problem 2.
+
+**Problem 4: dcluster's design assumes temporary, ephemeral resources**
+
+dcluster is built around the lifecycle of temporary compute — Spot instances for batch jobs that run and terminate. Having dcluster provision On-Demand instances for a persistent base CN is semantically misaligned: dcluster's cost optimization logic (Spot Fleet, bidding strategies) is irrelevant for On-Demand, and its Monitor would continuously try to reclaim a node that should never be reclaimed.
+
+**Actual effort comparison:**
 
 ```
 CA + ASG (standard path):
-  1. Create Spot ASG + Launch Template        ← AWS configuration
+  1. Base CN on On-Demand node group (persistent); burst uses Spot ASG + Mixed Instances Policy
   2. Add Cluster Autoscaler tags              ← 2 tag lines
   3. Add HPA YAML when needed                 ← 1 file
-  → Done. Zero code; all standard K8s/AWS components.
+  → Done. Zero code; all standard K8s/AWS components; no cross-system impact.
 
 dcluster path:
-  1. Permanent CN must be managed separately (not via dcluster, or Monitor treats it as orphan and reclaims it)
-  2. Write bridge: monitor CPU → on threshold call POST /node/launch → on low threshold call POST /node/destroy
-     (includes Prometheus query, API retry on failure, debounce logic)
-  3. Or modify dcluster Monitor to add "service type" recognition → risk of regression
-  4. Three-way debugging: bridge + dcluster + StarRocks
-  → One more custom-built component; any bugs must be fixed in-house.
+  1. Build bridge: poll metrics → call dcluster API (with retry, debounce)  ← custom component
+  2. Modify dcluster Monitor: add whitelist to prevent burst CN reclamation ← platform-wide re-release
+  3. dcluster new version release + compatibility testing                   ← coordination cost
+  → One extra trigger layer, one platform-wide release.
 ```
 
-**The core argument is not that dcluster can't do it, but that the cost of doing the same thing differs:**
+**Is dcluster's Spot Fleet / instance fallback useful for burst Spot?**
 
-| Dimension | CA + ASG | dcluster |
-|------|---------|----------|
-| Engineering cost | Zero code; pure configuration | Requires writing a bridge or modifying Monitor |
-| Risk | Mature solution; no regression risk | Modifying Monitor may affect existing Spark/Flink |
-| Ongoing maintenance | Standard components; well-documented | Bridge is custom-built; only we can maintain it |
-| dcluster's advantages | — | right-sizing, Spot Fleet, instance fallback, job lifecycle |
-| **Are these advantages applicable?** | — | **No** — CN spec is fixed; there is no job lifecycle concept |
+Yes, but ASG natively supports the same capability: ASG **Mixed Instances Policy** can configure multiple instance types (m5/m5a/m5n/r5 etc.) + weights + allocation strategy (capacity-optimized), with automatic fallback when one type is unavailable. No need for dcluster.
 
-dcluster's design goal is "run a Spark job → calculate optimal resources → destroy when done." StarRocks CN is "run continuously → add a few more when busy → reduce when idle" — this is exactly the native use case for CA + HPA. dcluster's core advantages (right-sizing, Spot Fleet, job lifecycle management) are all irrelevant in this scenario.
+dcluster's remaining advantages (right-sizing, job lifecycle management) are inapplicable — CN spec is fixed and there is no job concept.
+
+**Summary: we don't choose dcluster not because it "can't do it," but because** (1) it lacks a native trigger mechanism, requiring a custom bridge to replicate what HPA does for free, (2) modifying dcluster means a platform-wide re-release with regression risk, (3) Monitor semantics conflict with HPA, and (4) its ephemeral-resource design doesn't fit a persistent query service. CA + ASG: zero code, zero cross-system impact.
 
 ---
 ---
@@ -655,12 +690,12 @@ Records key questions, trade-offs, and conclusions from the Infra design phase. 
 
 **I. Scaling & Cost (Core Design Decisions)**
 - [D1: Which components in the architecture need scaling?](#d1-which-components-in-the-architecture-need-scaling)
-- [D2: CN Spot deployment option comparison](#d2-cn-spot-deployment-option-comparison)
+- [D2: CN deployment option comparison (On-Demand base + Spot burst)](#d2-cn-deployment-option-comparison-on-demand-base--spot-burst)
 - [D3: How to choose the CN node spec?](#d3-how-to-choose-the-cn-node-spec)
 - [D4: Is HPA needed at the current stage?](#d4-is-hpa-needed-at-the-current-stage)
 - [D5: Is it necessary to split CN into Query Pool and Refresh Pool?](#d5-is-it-necessary-to-split-cn-into-query-pool-and-refresh-pool)
 - [D6: Nightly MV refresh — 1 CN or 2?](#d6-nightly-mv-refresh--1-cn-or-2)
-- [D7: Why use Cluster Autoscaler + ASG + Spot instead of dcluster?](#d7-why-use-cluster-autoscaler--asg--spot-instead-of-dcluster)
+- [D7: Why use Cluster Autoscaler + ASG instead of dcluster?](#d7-why-use-cluster-autoscaler--asg-instead-of-dcluster)
 - [D8: What problems does dcluster solve that CA cannot?](#d8-what-problems-does-dcluster-solve-that-ca-cannot)
 
 **II. Multi-Tenancy and Data Model**
@@ -714,11 +749,11 @@ Core reason: compute-storage separation architecture. Data lives in S3 (permanen
 
 ---
 
-## D2: CN Spot Deployment Option Comparison
+## D2: CN Deployment Option Comparison (On-Demand base + Spot burst)
 
 `[Design Decision]`
 
-| | Option A | Option B ★ | Option C | ~~Option D~~ (eliminated) |
+| | Option A ★ | Option B | Option C | ~~Option D~~ (eliminated) |
 |--|--|--|--|--|
 | **Architecture** | 1× on-demand | 1× spot | 2× spot | 1× spot + temporary scale-up at night |
 | **Monthly cost** | ~$276 | ~$72 | ~$144 | ~$90 |
@@ -729,9 +764,9 @@ Core reason: compute-storage separation architecture. Data lives in S3 (permanen
 
 **Reason Option D was eliminated**: Its design premise is "nightly query and refresh compete for resources" — ToB systems have no users at night, so this premise does not hold.
 
-**Recommendation: Option B**. ToB internal system; fp-async callers can retry; occasional 2-3min interruptions are acceptable; saves 74% cost.
+**Recommendation: Option A**. CN continuously serves online queries; availability takes priority. Although CN is stateless (no data loss on interruption), "stateless" ≠ "interruptible" — in-flight queries have execution context (shuffle intermediate results, aggregation state) that is lost on interruption. ~$276/month is a reasonable investment for a core infrastructure component.
 
-**Spot interruption protection**: Enable **Capacity Rebalancing** on the ASG. When AWS detects that a spot instance is at risk of reclamation, it proactively requests a new spot instance first → starts the new node, then terminates the old one, minimizing the interruption gap. No code changes required; pure AWS configuration.
+**Future scaling strategy: base On-Demand + burst Spot**. When query concurrency grows and multiple CNs are needed, the base CN stays On-Demand while HPA-scaled overflow CNs use Spot to save cost. The worst case when Spot is reclaimed is "performance degrades to base level" rather than "service outage." Burst Spot ASG can enable **Capacity Rebalancing** to further reduce the interruption gap.
 
 ---
 
@@ -776,8 +811,8 @@ MV queries place almost no computational load on CN (each query reads a few hund
 
 **Current recommended configuration:**
 ```
-replicas: 1
-spot ASG: min=1, max=1   # No scaling; always running
+replicas: 1                    # On-Demand; always running
+# Future burst scaling: create Spot ASG when needed
 ```
 
 **When to add HPA:**
@@ -818,7 +853,7 @@ spec:
           averageUtilization: 60
 ```
 
-Spot configuration (ASG spot node group + toleration + affinity) refers to the earlier design and still applies:
+Spot configuration (only for future burst overflow CNs; base CN runs on On-Demand nodes and does not need this):
 
 ```yaml
 tolerations:
@@ -888,7 +923,7 @@ Constraints at night:
 1 CN:
   All 8 CPUs dedicated to MV refresh
   Runs 2-3 hours → fully meets the time window
-  Additional cost: $0 (this spot instance is already running)
+  Additional cost: $0 (this on-demand instance is already running)
 
 2 CNs (temporary scale-up):
   Finishes in 1–1.5 hours; 2x faster
@@ -900,27 +935,63 @@ No deadline pressure; finishing faster has no business value; spending more mone
 
 ---
 
-## D7: Why Use Cluster Autoscaler + ASG + Spot Instead of dcluster?
+## D7: Why Use Cluster Autoscaler + ASG Instead of dcluster?
 
 `[Design Decision]`
 
-dcluster is an internal company cluster management service built for Spark/Flink batch jobs; it is **not suited for StarRocks CN**, which is a long-running service:
+dcluster can technically manage burst Spot CN nodes, but we choose not to for four reasons:
 
-| Dimension | dcluster | CA + ASG + Spot |
-|------|---------|-----------------|
-| Design goal | Full lifecycle management of Spark/Flink batch jobs | General-purpose pod elastic scaling |
-| Trigger mechanism | Explicit REST API calls (POST /node/launch) | Automatically detects Pending Pods |
-| HPA integration | Not supported; requires custom bridge | Native chaining (Pending Pod is the contact point) |
-| Node cleanup | Depends on "job ends" event; Monitor treats nodes without jobs as garbage and reclaims them | Based on node utilization |
-| Migration cost | Medium (requires modifying Monitor; risk of breaking existing Spark/Flink) | Zero (configure ASG + Launch Template) |
+### Problem 1: Missing trigger mechanism — who calls dcluster?
 
-**Can dcluster manage temporarily scaled-out CN nodes?**
+This is the core issue. HPA has a **built-in feedback loop** — the entire chain is fully automatic:
 
-Technically feasible: permanent CN does not go through dcluster; temporary CNs are managed by dcluster as "jobs" and naturally reclaimed by the dcluster Monitor when done. However, this requires writing a bridge (monitor CPU → call dcluster API), and having permanent CN and temporary CN managed by two separate mechanisms doubles operational complexity.
+```
+HPA observes CPU metric → decides to add/remove replicas → Pending Pod triggers CA → CA calls ASG
+```
 
-CA + ASG uses a single mechanism to manage all CNs (permanent + temporary); HPA uniformly controls pod count; CA uniformly controls node count. dcluster's core advantages (right-sizing, Spot Fleet, instance fallback, job lifecycle) are all inapplicable in a scenario where CN spec is fixed and there is no job concept.
+dcluster has no such mechanism. It is designed to be explicitly called by a job scheduler (`POST /node/launch`); it does not observe metrics and make scaling decisions on its own. Using dcluster means building a bridge:
 
-**Conclusion**: Leave dcluster untouched; StarRocks CN follows the CA + ASG + Spot standard path. The two systems do not interfere with each other.
+```
+bridge polls Prometheus CPU metric → above threshold: call dcluster API → dcluster launches node
+                                   → below threshold: call dcluster API → dcluster destroys node
+(includes threshold logic, API retry on failure, debounce)
+```
+
+This adds an extra layer — a custom component that manually reimplements what HPA does natively.
+
+### Problem 2: Upgrading dcluster = platform-wide re-release risk
+
+dcluster serves the entire platform's Spark/Flink jobs. Modifying dcluster for StarRocks CN support (e.g., adding "service type" recognition so Monitor doesn't reclaim persistent CNs) means:
+- dcluster requires a new version release, affecting all existing users (Spark, Flink)
+- Changes to Monitor logic carry regression risk — misclassification could cause Spark/Flink nodes to be incorrectly reclaimed or retained
+- Release windows, rollback plans, and compatibility testing all require coordination
+
+CA + ASG are independent AWS/K8s standard components. Adding or removing a StarRocks ASG affects no other system.
+
+### Problem 3: Monitor orphan reclamation conflicts with HPA scaleDown
+
+dcluster Monitor checks every 5 minutes for nodes with no running jobs and reclaims them. Burst CNs may be temporarily idle during query troughs, but HPA hasn't decided to scale down yet (still within stabilizationWindow) — Monitor would treat these nodes as orphans and reclaim them prematurely, causing pod eviction and query disruption. The fix requires adding whitelist logic to Monitor, which circles back to Problem 2.
+
+### Problem 4: dcluster's design assumes temporary, ephemeral resources
+
+dcluster is built around the lifecycle of temporary compute — instances for batch jobs that run and terminate. Having dcluster provision On-Demand instances for a persistent base CN is semantically misaligned: dcluster's cost optimization logic (Spot Fleet, bidding strategies) is irrelevant for On-Demand, and its Monitor would continuously try to reclaim a node that should never be reclaimed.
+
+### Is dcluster's Spot Fleet / instance fallback useful for burst Spot?
+
+Yes, but ASG natively supports the same capability: ASG **Mixed Instances Policy** can configure multiple instance types (m5/m5a/m5n/r5 etc.) + weights + allocation strategy (capacity-optimized), with automatic fallback when one type is unavailable. No need for dcluster.
+
+### Comparison summary
+
+| Dimension | CA + ASG | dcluster |
+|------|---------|----------|
+| Trigger mechanism | HPA built-in feedback loop; fully automatic | Requires custom bridge (poll metrics → call API) |
+| Cross-system impact | Zero — independent ASG; no other systems affected | Requires dcluster upgrade; platform-wide re-release |
+| Node cleanup semantics | CA uses node utilization; aligns with HPA scaleDown | Monitor uses "has running job?"; conflicts with HPA |
+| Spot multi-instance types | ASG Mixed Instances Policy; native support | Spot Fleet supported, but ASG can do it too |
+| On-Demand base CN | Managed by standard K8s Deployment; no special tooling | Semantically misaligned — dcluster assumes ephemeral resources |
+| Engineering cost | Zero code; pure configuration | Custom bridge + Monitor changes + new version release |
+
+**Conclusion**: We don't choose dcluster not because it "can't do it," but because (1) it lacks a native trigger mechanism, requiring a custom bridge to replicate what HPA does for free, (2) modifying dcluster means a platform-wide re-release with regression risk, (3) Monitor semantics conflict with HPA, and (4) its ephemeral-resource design doesn't fit a persistent query service. CA + ASG: zero code, zero cross-system impact.
 
 **HPA + CA + ASG three-way chaining logic (when HPA is enabled in the future):**
 
@@ -929,7 +1000,7 @@ HPA increases CN replicas
   → New Pods become Pending (no suitable node)
   → Cluster Autoscaler sees Pending Pods
   → CA calls ASG scale-out
-  → ASG uses Launch Template to start Spot EC2
+  → ASG uses Launch Template to start Spot EC2 (burst overflow)
   → Node joins K8s (with label: role=starrocks-cn)
   → Scheduler places Pending Pod on the node
 
@@ -1137,7 +1208,7 @@ The SMT performs a full query of FP MySQL every 60s: `SELECT id, name, return_ty
 ### Infra decides independently
 
 - Kafka Connect commit interval → decided: 10min (D14)
-- CN node spec and Spot/HPA strategy → decided (D2-D4)
+- CN node spec and On-Demand/HPA strategy → decided (D2-D4)
 - S3 path naming convention
 - Iceberg catalog MySQL standalone instance → decided (D17)
 - per-tenant namespace → decided (D9)

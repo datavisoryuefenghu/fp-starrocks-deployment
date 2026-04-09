@@ -35,6 +35,7 @@ metadata:
     {{- include "chart.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
+  clusterIP: None
   ports:
     - name: mysql
       port: 9030
@@ -68,11 +69,15 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: starrocks-fe
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8030"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: starrocks-fe
           image: {{ .Values.starrocks.fe.image }}
-          command: ["/opt/starrocks/fe/bin/start_fe.sh"]
+          command: ["/opt/starrocks/fe/bin/start_fe.sh", "--host_type", "FQDN"]
           ports:
             - containerPort: 8030
               name: http
@@ -92,8 +97,9 @@ spec:
           livenessProbe:
             tcpSocket:
               port: 9030
-            initialDelaySeconds: 60
+            initialDelaySeconds: 120
             periodSeconds: 20
+            failureThreshold: 5
           resources:
             {{- toYaml .Values.starrocks.fe.resources | nindent 12 }}
           volumeMounts:

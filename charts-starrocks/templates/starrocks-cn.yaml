@@ -50,7 +50,9 @@ metadata:
     app.kubernetes.io/name: starrocks-cn
     {{- include "chart.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.starrocks.cn.hpa.enabled }}
   replicas: {{ .Values.starrocks.cn.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: starrocks-cn
@@ -58,6 +60,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: starrocks-cn
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8040"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: starrocks-cn
@@ -99,3 +105,27 @@ spec:
         - name: cn-cache
           emptyDir:
             sizeLimit: {{ .Values.starrocks.cn.cacheSizeLimit }}
+{{- if .Values.starrocks.cn.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: starrocks-cn
+  labels:
+    app.kubernetes.io/name: starrocks-cn
+    {{- include "chart.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: starrocks-cn
+  minReplicas: {{ .Values.starrocks.cn.hpa.minReplicas }}
+  maxReplicas: {{ .Values.starrocks.cn.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.starrocks.cn.hpa.targetCPUUtilizationPercentage }}
+{{- end }}

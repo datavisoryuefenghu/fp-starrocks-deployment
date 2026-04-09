@@ -38,28 +38,37 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: iceberg-kafka-connect
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9404"
+        prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: iceberg-kafka-connect
       initContainers:
-        - name: build-smt
-          image: maven:3.9-eclipse-temurin-17
+        - name: download-jmx-exporter
+          image: curlimages/curl:8.5.0
+          command: ["sh", "-c"]
+          args:
+            - curl -sL -o /jmx-exporter/jmx_prometheus_javaagent.jar
+              https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/1.0.1/jmx_prometheus_javaagent-1.0.1.jar
+          volumeMounts:
+            - name: jmx-exporter-jar
+              mountPath: /jmx-exporter
+        - name: download-smt
+          image: amazon/aws-cli:2.17.0
           command:
-            - bash
+            - sh
             - -c
             - |
               set -euo pipefail
-              mkdir -p /work/src/main/java/com/datavisor/smt /build-out
-              cp /src/pom.xml /work/pom.xml
-              cp /src/FeatureResolverTransform.java /work/src/main/java/com/datavisor/smt/FeatureResolverTransform.java
-              cd /work
-              mvn -q package -DskipTests
-              cp /work/target/fp-feature-smt-1.0.0.jar /build-out/fp-feature-smt.jar
+              mkdir -p /plugins/fp-feature-smt
+              aws s3 cp {{ .Values.kafkaConnect.smtJarS3Uri | quote }} /plugins/fp-feature-smt/fp-feature-smt.jar
+          env:
+            - name: AWS_REGION
+              value: {{ .Values.iceberg.restCatalog.s3.region | quote }}
           volumeMounts:
-            - name: smt-source
-              mountPath: /src
-              readOnly: true
-            - name: smt-build-out
-              mountPath: /build-out
+            - name: plugin-dir
+              mountPath: /plugins
         - name: install-plugins
           image: {{ .Values.kafkaConnect.image }}
           command:
@@ -68,21 +77,20 @@ spec:
             - |
               set -euo pipefail
               confluent-hub install --no-prompt --component-dir /plugins iceberg/iceberg-kafka-connect:{{ .Values.kafkaConnect.icebergConnectorVersion }}
-              mkdir -p /plugins/fp-feature-smt
-              cp /build-out/fp-feature-smt.jar /plugins/fp-feature-smt/fp-feature-smt.jar
           volumeMounts:
             - name: plugin-dir
               mountPath: /plugins
-            - name: smt-build-out
-              mountPath: /build-out
-              readOnly: true
       containers:
         - name: kafka-connect
           image: {{ .Values.kafkaConnect.image }}
           ports:
             - name: rest
               containerPort: 8083
+            - name: jmx-metrics
+              containerPort: 9404
           env:
+            - name: KAFKA_OPTS
+              value: "-javaagent:/jmx-exporter-jar/jmx_prometheus_javaagent.jar=9404:/jmx-exporter-config/config.yaml"
             - name: CONNECT_BOOTSTRAP_SERVERS
               value: {{ .Values.kafkaConnect.bootstrapServers | quote }}
             - name: CONNECT_REST_PORT
@@ -111,6 +119,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: CONNECT_OFFSET_FLUSH_INTERVAL_MS
+              value: "10000"
+            - name: CONNECT_SESSION_TIMEOUT_MS
+              value: "30000"
+            - name: CONNECT_HEARTBEAT_INTERVAL_MS
+              value: "10000"
             - name: CONNECT_PLUGIN_PATH
               value: "/usr/share/java,/usr/share/confluent-hub-components,/plugins"
             - name: AWS_REGION
@@ -137,11 +151,17 @@ spec:
             - name: plugin-dir
               mountPath: /plugins
               readOnly: true
+            - name: jmx-exporter-jar
+              mountPath: /jmx-exporter-jar
+              readOnly: true
+            - name: jmx-exporter-config
+              mountPath: /jmx-exporter-config
+              readOnly: true
       volumes:
         - name: plugin-dir
           emptyDir: {}
-        - name: smt-build-out
+        - name: jmx-exporter-jar
           emptyDir: {}
-        - name: smt-source
+        - name: jmx-exporter-config
           configMap:
-            name: fp-feature-smt-source
+            name: kafka-connect-jmx-config

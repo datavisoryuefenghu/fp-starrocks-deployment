@@ -8,7 +8,7 @@ metadata:
   annotations:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
-    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-delete-policy": hook-succeeded,before-hook-creation
 spec:
   backoffLimit: 5
   template:
@@ -43,6 +43,22 @@ spec:
 
               echo "=== Verifying CN ==="
               mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "SHOW COMPUTE NODES;"
+
+              echo "=== Creating default storage volume ==="
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "
+                CREATE STORAGE VOLUME IF NOT EXISTS mv_storage_volume
+                TYPE = S3
+                LOCATIONS = ('s3://{{ .Values.starrocks.fe.s3.bucket }}/{{ .Values.starrocks.fe.s3.path }}')
+                PROPERTIES (
+                  'aws.s3.region' = '{{ .Values.starrocks.fe.s3.region }}',
+                  'aws.s3.use_instance_profile' = '{{ .Values.starrocks.fe.s3.useInstanceProfile }}',
+                  'aws.s3.endpoint' = 's3.{{ .Values.starrocks.fe.s3.region }}.amazonaws.com'
+                );
+                SET mv_storage_volume AS DEFAULT STORAGE VOLUME;
+              " 2>&1 || echo "Storage volume may already exist"
+
+              echo "=== Verifying storage volume ==="
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "DESC STORAGE VOLUME mv_storage_volume\G"
 
               echo "=== Creating Iceberg catalog ==="
               mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "

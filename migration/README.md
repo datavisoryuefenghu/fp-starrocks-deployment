@@ -22,16 +22,43 @@ Iceberg table: {tenant}.event_result (via REST catalog)
 
 ## Prerequisites
 
-```bash
-pip install -r requirements.txt
-```
-
-AWS credentials must be available via environment variables or instance profile (boto3 credential chain).
+AWS credentials must be available via environment variables, instance profile, or IRSA (boto3 credential chain).
 
 The Iceberg table is pre-created by `POST /iceberg/connector/{tenant}` (FP API). If the table
 does not yet exist, the script creates it automatically from the first batch's schema.
 
-## Usage
+## Quick start (Kubernetes)
+
+```bash
+# 1. Build image
+bash migration/build.sh
+
+# 2. Push to ECR (or your registry)
+REGISTRY=123456789.dkr.ecr.us-west-2.amazonaws.com bash migration/build.sh --push
+
+# 3. Edit job.yaml — fill in CONFIGURE sections (tenant, S3 files, CH url, image)
+#    Then apply:
+kubectl apply -f migration/job.yaml -n duckdb
+
+# 4. Watch logs
+kubectl logs -f job/ch-iceberg-migration-rippling -n duckdb
+
+# 5. Cleanup
+kubectl delete job ch-iceberg-migration-rippling -n duckdb
+```
+
+Or use `envsubst` for scripted deploys:
+```bash
+export TENANT=rippling
+export S3_FILES="s3://bucket/path/file1.csv.gz s3://bucket/path/file2.csv.gz"
+envsubst < migration/job.yaml | kubectl apply -n duckdb -f -
+```
+
+## Usage (local / bare Python)
+
+```bash
+pip install -r requirements.txt
+```
 
 ### Recommended: explicit S3 files
 
