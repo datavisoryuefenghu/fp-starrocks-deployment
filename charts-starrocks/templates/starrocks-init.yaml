@@ -36,13 +36,7 @@ spec:
               HOST="starrocks-fe"
               PORT=9030
 
-              echo "=== Registering CN ==="
-              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "
-                ALTER SYSTEM ADD COMPUTE NODE 'starrocks-cn:9050';
-              " 2>&1 || echo "CN may already be registered"
-
-              echo "=== Verifying CN ==="
-              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "SHOW COMPUTE NODES;"
+              echo "=== CN registration handled by CN init containers ==="
 
               echo "=== Creating default storage volume ==="
               mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "

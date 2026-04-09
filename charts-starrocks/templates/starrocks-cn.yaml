@@ -8,13 +8,21 @@ metadata:
 data:
   cn.conf: |
     LOG_DIR = ${STARROCKS_HOME}/log
-    JAVA_OPTS="-Dlog4j2.formatMsgNoLookups=true -Xmx4096m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError"
+    JAVA_OPTS="-Dlog4j2.formatMsgNoLookups=true -Xmx4096m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED"
 
     thrift_port = 9060
     webserver_port = 8040
     heartbeat_service_port = 9050
     brpc_port = 8060
     starlet_port = 9070
+
+    # Data cache — disk + memory
+    datacache_disk_path = /opt/starrocks/cn/storage/datacache
+    datacache_mem_size = 4294967296
+    datacache_disk_size = 21474836480
+
+    # S3 scan parallelism
+    connector_io_tasks_per_scan_operator = 32
 ---
 apiVersion: v1
 kind: Service
@@ -65,6 +73,27 @@ spec:
         prometheus.io/port: "8040"
         prometheus.io/path: "/metrics"
     spec:
+      initContainers:
+        - name: register-cn
+          image: mysql:8.0
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              HOST="starrocks-fe"
+              PORT=9030
+              echo "Waiting for FE..."
+              until mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e "SELECT 1" 2>/dev/null; do
+                sleep 3
+              done
+              echo "Registering ${POD_IP}:9050..."
+              mysql -h "$HOST" -P "$PORT" -u root --ssl-mode=DISABLED -e \
+                "ALTER SYSTEM ADD COMPUTE NODE '${POD_IP}:9050';" 2>&1 || echo "Already registered"
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
       containers:
         - name: starrocks-cn
           image: {{ .Values.starrocks.cn.image }}

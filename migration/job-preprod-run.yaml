@@ -1,0 +1,40 @@
+# Real migration job for preprod — writes data to Iceberg.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ch-iceberg-migration-rippling
+  namespace: preprod
+  labels:
+    app.kubernetes.io/name: ch-iceberg-migration
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: fp-iceberg-storage
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ch-iceberg-migration
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migration
+          image: docker-registry.dv-api.com/cloud/ch_iceberg_migration:latest
+          args:
+            - "--tenant"
+            - "rippling"
+            - "--s3-source"
+            - "s3://datavisor-preprod-us-west-2-iceberg/cre-6630/test_chi_data/"
+            - "--iceberg-catalog-url"
+            - "http://iceberg-rest-catalog:8181"
+            - "--clickhouse-url"
+            - "http://clickhouse-dv:8123"
+            - "--aws-region"
+            - "us-west-2"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi

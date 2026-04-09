@@ -25,15 +25,15 @@ starrocks:
 
   cn:
     image: "starrocks/cn-ubuntu:4.0.8"
-    replicas: 1
-    cacheSizeLimit: 10Gi
+    replicas: 2
+    cacheSizeLimit: 30Gi
     resources:
       requests:
-        cpu: "2"
-        memory: 8Gi
+        cpu: "4"
+        memory: 16Gi
       limits:
-        cpu: "2"
-        memory: 8Gi
+        cpu: "4"
+        memory: 16Gi
     hpa:
       enabled: false
       minReplicas: 1
